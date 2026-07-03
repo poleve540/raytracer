@@ -10,27 +10,62 @@ DEG2RAD :: math.RAD_PER_DEG
 Vector3 :: [3]f64
 Color :: distinct [3]f64
 
-MaterialType :: enum
-{
-	Lambertian,
-	Metal,
-	Dielectric
-}
-
 Ray :: struct
 {
 	origin: Vector3,
 	direction: Vector3
 }
 
+Lambertian :: struct
+{
+	albedo: Color
+}
+
+Metal :: struct
+{
+	albedo: Color,
+	fuzz: f64
+}
+
+Dielectric :: struct
+{
+	refraction_index: f64
+}
+
+Material :: union
+{
+	Lambertian,
+	Metal,
+	Dielectric
+}
+
 Sphere :: struct
 {
 	center: Vector3,
 	radius: f64,
-	mat: MaterialType,
-	albedo: Color,
-	fuzz: f64,
-	refraction_index: f64
+	mat: Material,
+}
+
+Cube :: struct
+{
+	center: Vector3,
+	size: Vector3,
+	mat: Material,
+}
+
+Cylinder :: struct
+{
+	base: Vector3,
+	axis: Vector3,
+	radius: f64,
+	height: f64,
+	mat: Material
+}
+
+Shape :: union
+{
+	Sphere,
+	Cylinder
 }
 
 HitRecord :: struct
@@ -39,10 +74,49 @@ HitRecord :: struct
 	normal: Vector3,
 	t: f64,
 	front_face: bool,
-	mat: MaterialType,
-	albedo: Color,
-	fuzz: f64,
-	refraction_index: f64
+	mat: Material
+}
+
+cylinder_hit :: proc(cylinder: Cylinder, ray: Ray, tmin, tmax: f64) -> (HitRecord, bool)
+{
+	a := cylinder.axis
+	r := cylinder.radius
+	b := cylinder.base
+
+	oc := cylinder.base - ray.origin
+
+	nxa := linalg.cross(ray.direction, a)
+
+	if linalg.length(nxa) <= math.F64_EPSILON do return {}, false
+	
+	bnxa := linalg.dot(oc, nxa)
+	discriminant := linalg.dot(nxa, nxa) * r*r - linalg.dot(a, a) * bnxa*bnxa
+
+	if discriminant < 0 do return {}, false
+
+	d := (linalg.dot(nxa, linalg.cross(oc, a)) - math.sqrt(discriminant)) /
+	     (linalg.dot(nxa, nxa))
+	t := linalg.dot(a, ray.direction*d - oc)
+	if d <= tmin || d >= tmax || t < 0 || t > cylinder.height
+	{
+		d = (linalg.dot(nxa, linalg.cross(oc, a)) + math.sqrt(discriminant)) /
+		     (linalg.dot(nxa, nxa))
+		t = linalg.dot(a, ray.direction*d - oc)
+		if d <= tmin || d >= tmax || t < 0 || t > cylinder.height do return {}, false
+	}
+
+	hit := HitRecord{}
+	hit.point = ray.origin + ray.direction * d
+
+	hit.normal = linalg.normalize(ray.direction*d - cylinder.axis*t - oc)
+
+	hit.front_face = linalg.dot(ray.direction, hit.normal) < 0
+	if !hit.front_face do hit.normal = -hit.normal
+
+	hit.t = d
+	hit.mat = cylinder.mat
+
+	return hit, true
 }
 
 sphere_hit :: proc(sphere: Sphere, ray: Ray, tmin, tmax: f64) -> (HitRecord, bool)
@@ -77,9 +151,6 @@ sphere_hit :: proc(sphere: Sphere, ray: Ray, tmin, tmax: f64) -> (HitRecord, boo
 	hit_record.normal = (hit_record.point - sphere.center) / sphere.radius
 
 	hit_record.mat = sphere.mat
-	hit_record.albedo = sphere.albedo
-	hit_record.fuzz = sphere.fuzz
-	hit_record.refraction_index = sphere.refraction_index
 
 	hit_record.front_face = linalg.dot(ray.direction, hit_record.normal) < 0
 	if !hit_record.front_face do hit_record.normal = -hit_record.normal
@@ -112,28 +183,35 @@ reflect :: proc(v, n: Vector3) -> Vector3
 	return v - 2*linalg.dot(v, n)*n
 }
 
-ray_color :: proc(ray: Ray, spheres: []Sphere, depth: int) -> Color
+ray_color :: proc(ray: Ray, shapes: []Shape, depth: int) -> Color
 {
 	if depth <= 0 do return Color{}
 
 	hit := HitRecord{}
 	hit_anything := false
 	closest_so_far := math.inf_f64(1)
-	for sphere in spheres
+	for shape in shapes
 	{
-		hit = sphere_hit(sphere, ray, 0.001, closest_so_far) or_continue
+		switch s in shape
+		{
+		case Sphere:
+			hit = sphere_hit(s, ray, 0.001, closest_so_far) or_continue
+		case Cylinder:
+			hit = cylinder_hit(s, ray, 0.001, closest_so_far) or_continue
+		}
+
 		hit_anything = true
 		closest_so_far = hit.t
 	}
 
 	if hit_anything
 	{
-		switch (hit.mat)
+		switch mat in hit.mat
 		{
-		case .Dielectric:
+		case Dielectric:
 			direction := Vector3{}
 
-			refraction_index := hit.front_face ? 1/hit.refraction_index : hit.refraction_index
+			refraction_index := hit.front_face ? 1/mat.refraction_index : mat.refraction_index
 			unit_dir := linalg.normalize(ray.direction)
 			cos_theta := min(linalg.dot(-unit_dir, hit.normal), 1.0)
 			sin_theta := math.sqrt(1.0 - cos_theta*cos_theta)
@@ -153,22 +231,22 @@ ray_color :: proc(ray: Ray, spheres: []Sphere, depth: int) -> Color
 				direction = r_out_perp + r_out_parallel
 			}
 
-			return Color(1) * ray_color({hit.point, direction}, spheres, depth-1)
+			return Color(1) * ray_color({hit.point, direction}, shapes, depth-1)
 
-		case .Lambertian:
+		case Lambertian:
 			reflected_direction := random_unit_vector() + hit.normal
 			if linalg.all(linalg.less_than(reflected_direction, Vector3(math.F64_EPSILON)))
 			{
 				reflected_direction = hit.normal
 			}
-			return hit.albedo * ray_color({hit.point, reflected_direction}, spheres, depth-1)
+			return mat.albedo * ray_color({hit.point, reflected_direction}, shapes, depth-1)
 
-		case .Metal:
+		case Metal:
 			reflected := reflect(ray.direction, hit.normal)
-			reflected = linalg.normalize(reflected) + (hit.fuzz * random_unit_vector())
+			reflected = linalg.normalize(reflected) + (mat.fuzz * random_unit_vector())
 			if linalg.dot(reflected, hit.normal) > 0
 			{
-				return hit.albedo * ray_color({hit.point, reflected}, spheres, depth-1)
+				return mat.albedo * ray_color({hit.point, reflected}, shapes, depth-1)
 			}
 			else
 			{
@@ -183,18 +261,18 @@ ray_color :: proc(ray: Ray, spheres: []Sphere, depth: int) -> Color
 
 main :: proc()
 {
-	IMAGE_WIDTH :: 1200
-	IMAGE_HEIGHT :: 675
+	IMAGE_WIDTH :: 400
+	IMAGE_HEIGHT :: 225
 
-	fov: f64 = 20*DEG2RAD
+	fov: f64 = 40*DEG2RAD
 
-	lookfrom := Vector3{5, 10, 3}
-	lookat := Vector3{0, 0, 0}
+	lookfrom := Vector3{-2, 2, 1}
+	lookat := Vector3{0, 0, -1}
 	vup := Vector3{0, 1, 0}
 
 	camera_center := lookfrom
 
-	defocus_angle: f64 = 0.6
+	defocus_angle: f64 = 0
 	focus_dist: f64 = 10
 
 	w := linalg.normalize(lookfrom - lookat)
@@ -221,61 +299,73 @@ main :: proc()
 	fmt.println("255")
 
 	// --- 3 spheres ---
-	// spheres := []Sphere{
-	// 	{{0, -100.5, -1}, 100, .Lambertian, {0.8, 0.8, 0}, 0, 0},
-	// 	{{0, 0, -1.2}, 0.5, .Lambertian, {0.1, 0.2, 0.5}, 0, 0},
-	// 	{{-1, 0, -1}, 0.5, .Dielectric, {}, 0, 1.5},
-	// 	{{-1, 0, -1}, 0.4, .Dielectric, {}, 0, 1/1.5},
-	// 	{{1, 0, -1}, 0.5, .Metal, {0.8, 0.6, 0.2}, 1, 0},
+	// spheres := []Shape{
+	// 	Sphere{{0, -100.5, -1}, 100, Lambertian{{0.8, 0.8, 0}}},
+	// 	Sphere{{0, 0, -1.2}, 0.5, Lambertian{{0.1, 0.2, 0.5}}},
+	// 	Sphere{{-1, 0, -1}, 0.5, Dielectric{1.5}},
+	// 	Sphere{{-1, 0, -1}, 0.4, Dielectric{1/1.5}},
+	// 	Sphere{{1, 0, -1}, 0.5, Metal{{0.8, 0.6, 0.2}, 1}},
 	// }
 
-	// --- Weiner ---
-	spheres := make([dynamic]Sphere)
-	append(&spheres, Sphere{{0, -1000, 0}, 1000, .Lambertian, {0.8, 0.5, 0.5}, 0, 0})
+	// shapes := []Shape{
+	// 	Sphere{{0, -100.5, -1}, 100, Lambertian{{0.8, 0.8, 0}}},
+	// 	Sphere{{0, 0, -1.2}, 0.5, Lambertian{{0.1, 0.2, 0.5}}},
+	// }
+	//
+	// cylinder := Cylinder{{0, -0.5, -1.2}, {0, 1, 0}, 0.5, 1.0, Lambertian{{0.1, 0.2, 0.5}}}
+	// shapes[1] = cylinder
 
-	skin := Color{232.0/256, 174.0/256, 120.0/256}
-	append(&spheres, Sphere{{0, 0.2, 0}, 0.2, .Lambertian, skin, 0, 0})
-	append(&spheres, Sphere{{-0.3, 0.2, 0}, 0.2, .Lambertian, skin, 0, 0})
-	append(&spheres, Sphere{{-0.6, 0.2, 0}, 0.2, .Lambertian, skin, 0, 0})
-
-	tip := Color{239.0/256, 160.0/256, 230.0/256}
-	append(&spheres, Sphere{{-0.9, 0.2, 0}, 0.2, .Lambertian, tip, 0, 0})
-
-	ball := Color(0.8)
-	append(&spheres, Sphere{{0.4, 0.2, 0.4}, 0.4, .Metal, ball, 0, 0})
-	append(&spheres, Sphere{{0.4, 0.2, -0.4}, 0.4, .Metal, ball, 0, 0})
+	//--- Weiner ---
+	// spheres := make([dynamic]Shape)
+	// append(&spheres, Sphere{{0, -1000, 0}, 1000, Lambertian{{0.8, 0.5, 0.5}}})
+	//
+	// skin := Lambertian{{232.0/256, 174.0/256, 120.0/256}}
+	// append(&spheres, Sphere{{0, 0.2, 0}, 0.2, skin})
+	// append(&spheres, Sphere{{-0.3, 0.2, 0}, 0.2, skin})
+	// append(&spheres, Sphere{{-0.6, 0.2, 0}, 0.2, skin})
+	//
+	// // tip := Lambertian{{239.0/256, 160.0/256, 230.0/256}}
+	// tipin := Dielectric{1.0/1.5}
+	// tipout := Dielectric{1.5}
+	// append(&spheres, Sphere{{-0.9, 0.21, 0}, 0.15, tipin})
+	// append(&spheres, Sphere{{-0.9, 0.21, 0}, 0.2, tipout})
+	//
+	// ball := Metal{0.8, 0}
+	// append(&spheres, Sphere{{0.4, 0.2, 0.4}, 0.4, ball})
+	// append(&spheres, Sphere{{0.4, 0.2, -0.4}, 0.4, ball})
 
 	// --- Cover ---
-	// for a in -11..<11
-	// {
-	// 	for b in -11..<11
-	// 	{
-	// 		choose_mat := rand.float64()
-	// 		center := Vector3{cast(f64)a + 0.9*rand.float64(), 0.2, cast(f64)b + 0.9*rand.float64()}
-	// 		if linalg.distance(Vector3{4, 0.2, 0}, center) > 0.9
-	// 		{
-	// 			switch
-	// 			{
-	// 			case choose_mat < 0.8:
-	// 				albedo := Color{rand.float64(),rand.float64(),rand.float64()}
-	// 				append(&spheres, Sphere{center, 0.2, .Lambertian, albedo * albedo, 0, 0})
-	//
-	// 			case choose_mat < 0.95:
-	// 				albedo := Color{rand.float64_range(0.5,1),rand.float64_range(0.5,1),rand.float64_range(0.5,1)}
-	// 				fuzz := rand.float64_range(0, 0.5)
-	// 				append(&spheres, Sphere{center, 0.2, .Metal, albedo, fuzz, 0})
-	//
-	// 			case:
-	// 				append(&spheres, Sphere{center, 0.2, .Dielectric, 0, 0, 1.5})
-	// 			}
-	// 		}
-	// 	}
-	// }
-	// append(&spheres, Sphere{{0, 1, 0}, 1, .Dielectric, 0, 0, 1.5})
-	// append(&spheres, Sphere{{-4, 1, 0}, 1, .Lambertian, {0.4, 0.2, 0.1}, 0, 0})
-	// append(&spheres, Sphere{{4, 1, 0}, 1, .Metal, {0.7, 0.6, 0.5}, 0, 0})
+	spheres: [dynamic]Shape
+	for a in -11..<11
+	{
+		for b in -11..<11
+		{
+			choose_mat := rand.float64()
+			center := Vector3{cast(f64)a + 0.9*rand.float64(), 0.2, cast(f64)b + 0.9*rand.float64()}
+			if linalg.distance(Vector3{4, 0.2, 0}, center) > 0.9
+			{
+				switch
+				{
+				case choose_mat < 0.8:
+					albedo := Color{rand.float64(),rand.float64(),rand.float64()}
+					append(&spheres, Sphere{center, 0.2, Lambertian{albedo * albedo}})
 
-	NUM_SAMPLES_PER_PIXEL :: 100
+				case choose_mat < 0.95:
+					albedo := Color{rand.float64_range(0.5,1),rand.float64_range(0.5,1),rand.float64_range(0.5,1)}
+					fuzz := rand.float64_range(0, 0.5)
+					append(&spheres, Sphere{center, 0.2, Metal{albedo, fuzz}})
+
+				case:
+					append(&spheres, Sphere{center, 0.2, Dielectric{1.5}})
+				}
+			}
+		}
+	}
+	append(&spheres, Sphere{{0, 1, 0}, 1, Dielectric{1.5}})
+	append(&spheres, Sphere{{-4, 1, 0}, 1, Lambertian{{0.4, 0.2, 0.1}}})
+	append(&spheres, Sphere{{4, 1, 0}, 1, Metal{{0.7, 0.6, 0.5}, 0}})
+
+	NUM_SAMPLES_PER_PIXEL :: 50
 	MAX_DEPTH :: 50
 
 	for y in 0..<IMAGE_HEIGHT
